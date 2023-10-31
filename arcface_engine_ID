@@ -1,0 +1,218 @@
+"""
+Code for building model & database and comparing representations for face recognition 
+"""
+
+import numpy as np
+import pandas as pd
+import torch
+from torchvision import transforms as trans
+
+import argparse
+from config import get_config
+
+from mtcnn import MTCNN
+from Learner import *
+from utils import *
+
+
+
+
+# create databanker.pth
+# python /workspace/Face-Recognition/create-dataset/align_dataset_mtcnn.py /workspace/Face-Recognition/Data/raw/ /workspace/Face-Recognition/Data/processed 
+#--image_size 112
+
+def get_ID_model(conf): 
+
+    parser = argparse.ArgumentParser(description='for face verification')
+    parser.add_argument('-th','--threshold',help='threshold to decide identical faces',default=1.54, type=float)
+    args = parser.parse_args() #no need
+
+    #model load => use_mobilfacenet or ir_se
+    #head = Arcface 로 training 함
+    learner = face_learner(conf, inference=True)
+
+    learner.threshold = args.threshold
+
+    if conf.device.type == 'cpu':
+        learner.load_state(conf, 'cpu_final.pth', from_save_folder=True, model_only=True)
+    else:
+        # save folder에서 pretained weights 가져오기
+        # model_ir_se50.pth
+        learner.load_state(conf, 'final.pth', from_save_folder=True, model_only=True)
+
+    # Evaluate mode. 
+    Model = learner.model
+
+    Model.eval()
+
+    return Model
+
+
+############ make embedding database #############
+def calc_embedding(conf, model, mtcnn, tta = True):
+    """
+    Calculate feature embedding of single input image based on face recognition model. 
+    Assumes input is cropped image of face, and in RGB format. 
+    """
+    embeddings =  [] # 이미지 임베딩을 저장
+    names = [] # 각 임베딩에 대한 이름을 저장하는 목록으로, 초기 값으로 "Unknown"
+
+    for path in conf.facebank_path.iterdir(): #access to image dir
+        if path.is_file():
+            continue
+        else:
+            embs = []
+            for file in path.iterdir():
+                if not file.is_file():
+                    continue
+                else:
+                    try:
+                        img = Image.open(file)
+                    except:
+                        continue
+                    if img.size != (112, 112):      #standarize
+                        img = mtcnn.align(img)      #MTCNN(Multi-task Cascaded Convolutional Networks)을 사용하여 이미지를 정렬
+
+                    with torch.no_grad():
+                        if tta:
+                            mirror = trans.functional.hflip(img)
+                            emb = model(conf.test_transform(img).to(conf.device).unsqueeze(0))
+                            emb_mirror = model(conf.test_transform(mirror).to(conf.device).unsqueeze(0))
+                            embs.append(l2_norm(emb + emb_mirror))
+                        else:                        
+                            embs.append(model(conf.test_transform(img).to(conf.device).unsqueeze(0)))
+       
+        if len(embs) == 0:
+            continue
+        # Convert into Torch tensor
+        # 모든 이미지에 대한 임베딩 계산이 완료 => 모든 임베딩을 평균하여 하나의 임베딩 벡터
+        # 이 벡터와 해당 디렉토리의 이름(얼굴의 ID)을 각각 embeddings 및 names 목록에 추가
+        embedding = torch.cat(embs).mean(0,keepdim=True)
+        embeddings.append(embedding)
+        names.append(path.name)    #save name
+
+    #################### Add 'unknown' embedding ##################
+    unknown = torch.zeros_like(embeddings[0]) # 존재하는 임베딩 목록(embeddings)의 맨 앞에 'unknown' 임베딩을 추가
+    embeddings.insert(0, unknown)
+    names.insert(0, 'unknown')
+
+    embeddings = torch.cat(embeddings)
+    names = np.array(names)
+    torch.save(embeddings, conf.facebank_path/'facebank.pth')
+    np.save(conf.facebank_path/'names.npy', names)
+    return embeddings, names
+
+
+
+# 이미 저장된 얼굴 데이터베이스를 다시 불러오기
+def load_facebank(conf):
+    embeddings = torch.load(conf.facebank_path/'facebank.pth')
+    names = np.load(conf.facebank_path/'names.npy')
+    return embeddings, names
+
+
+def infer(conf, model, faces, database_embs, tta=False):
+        ''' 
+        faces : list of PIL Image =>  얼굴 이미지의 목록 : 임베딩을 추출하려는 대상 이미지에서 얼굴 부분을 잘라내고, 그 얼굴 이미지들을 "faces" 목록에 저장
+        database_embs : [n, 512] computed embeddings of faces in facebank => 데이터베이스에 저장된 얼굴 임베딩 벡터
+        names : recorded names of faces in facebank
+        tta : test time augmentation (hfilp, that's all)
+        '''
+        embs = []
+        for img in faces:
+            if tta:
+                mirror = trans.functional.hflip(img)
+                emb = model(conf.test_transform(img).to(conf.device).unsqueeze(0))
+                # unsqueeze(0) : 텐서의 첫 번째 차원(인덱스 0) 앞에 새로운 차원을 추가
+                emb_mirror = model(conf.test_transform(mirror).to(conf.device).unsqueeze(0))
+                embs.append(l2_norm(emb + emb_mirror))
+            else:                        
+                embs.append(model(conf.test_transform(img).to(conf.device).unsqueeze(0)))
+        source_embs = torch.cat(embs)
+        
+        diff = source_embs.unsqueeze(-1) - database_embs.transpose(1,0).unsqueeze(0)
+        #distance
+        dist = torch.sum(torch.pow(diff, 2), dim=1)
+        minimum, min_idx = torch.min(dist, dim=1)
+        min_idx[minimum > conf.threshold] = -1 # if no match, set idx to -1
+        # config 파일 threshold = 1.5 
+        return min_idx, minimum           # min_idx 제일 가까운 id를 말함 / minimum은 각 입력 얼굴과 데이터베이스의 얼굴 간의 거리 중에서 가장 작은 값
+
+
+
+def compare_embeddings(conf, model, input_image_path, mtcnn, database_embs, tta):
+
+    # processing input image
+    try:
+        image = Image.open(input_image_path)
+    except:
+        return []
+
+    if image.size != (112, 112):  # 이미지 크기를 표준화
+        image = mtcnn.align(image)
+
+    try:
+        bboxes, faces = mtcnn.align_multi(image, limit=conf.face_limit)
+    except:
+        bboxes = []
+
+    # 얼굴 인식 결과를 얻는 부분
+    # infer() => return min_idx, minimum  
+    results = infer(conf, model, faces, database_embs, tta)
+
+
+    if len(bboxes) > 0:
+    # 얼굴 검출 결과가 있는 경우
+        bboxes = bboxes[:, :-1]  # shape: [10, 4], only keep 10 highest possibility faces
+        bboxes = bboxes.astype(int)
+        bboxes = bboxes + [-1, -1, 1, 1]  # Personal choice
+        assert bboxes.shape[0] == results[0].shape[0], 'bbox and faces number not the same'
+
+        # 모든 얼굴 결과를 저장할 리스트 초기화
+        face_results = []
+
+        for i in range(len(bboxes)):
+            face_result = {}
+            face_result['box'] = bboxes[i].tolist()
+            face_result['result'] = int(results[0][i])   #min_idx
+            face_results.append(face_result)
+
+        # 얼굴 검출 결과 및 인식 결과
+        return face_results
+    else:
+        # 얼굴 검출 결과가 없는 경우
+        return []
+
+
+
+
+def main():
+    # conf => weigths 등 path 저장 / image path
+    conf = get_config(False)
+    # load model
+    model = get_ID_model(conf) 
+
+    mtcnn = MTCNN()
+
+    # 이미 저장된 얼굴 데이터베이스 로드 => to get facebank.pth
+    embeddings, names = calc_embedding(conf, model, mtcnn, tta = True)
+
+    embeddings, names = load_facebank(conf)  
+    tta = True  # Test-time augmentation 설정
+
+    input_image_path = "/workspace/Face-Recognition/test_input_img/2.jpg"  # 입력 이미지 경로 "ross"
+    input_image_path = "/workspace/Face-Recognition/test_input_img/1.jpg"  # 입력 이미지 경로 "전지현"
+
+    results = compare_embeddings(conf, model, input_image_path, mtcnn, embeddings, tta)
+
+    # face_results => 각 얼굴에 대한 검출 결과와 인식 결과
+    for face_result in results:
+        print("Bounding Box:", face_result['box']) #각 얼굴에 대한 검출 결과
+        print("Recognition Result:", face_result['result']) #인식 결과 id
+        print("Recognition Result:", names[face_result['result']]) #인식 결과 name
+
+
+
+
+if __name__ == "__main__":
+    main()
